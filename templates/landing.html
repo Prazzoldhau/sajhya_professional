@@ -1,0 +1,44 @@
+{% load static %}<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sajhya Professional - your physiotherapy workspace</title>
+<meta name="description" content="A private workspace for physiotherapists and other rehabilitation professionals: patients, SOAP notes, assessments, treatment plans and home exercise programmes.">
+<link rel="icon" href="{% static 'images/favicon.png' %}">
+<style>
+  :root { --green:#16834f; --ink:#12301f; --muted:#5b7466; --line:#d9e8df; --bg:#f4faf6; }
+  * { box-sizing:border-box; } body { margin:0; font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; color:var(--ink); background:var(--bg); }
+  header { display:flex; align-items:center; gap:12px; padding:14px 6vw; background:#fff; border-bottom:1px solid var(--line); }
+  header img { width:38px; height:38px; } header b { font-size:18px; } header .sp { flex:1; }
+  a.btn { display:inline-block; padding:10px 18px; border-radius:9px; text-decoration:none; font-weight:700; border:1px solid var(--green); color:var(--green); background:#fff; }
+  a.btn.primary { background:var(--green); color:#fff; }
+  .hero { padding:64px 6vw 40px; max-width:980px; margin:0 auto; } .hero h1 { font-size:clamp(30px,5vw,46px); line-height:1.15; margin:0 0 14px; }
+  .hero p { font-size:18px; color:var(--muted); max-width:640px; margin:0 0 26px; } .hero .actions { display:flex; gap:12px; flex-wrap:wrap; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:16px; max-width:980px; margin:20px auto 60px; padding:0 6vw; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:12px; padding:18px; } .card h3 { margin:0 0 6px; font-size:17px; } .card p { margin:0; color:var(--muted); font-size:14.5px; line-height:1.5; }
+  footer { text-align:center; color:var(--muted); font-size:13px; padding:24px; border-top:1px solid var(--line); background:#fff; }
+</style>
+</head>
+<body>
+<header>
+  <img src="{% static 'images/logo-64.png' %}" alt=""><b>Sajhya Professional</b><span class="sp"></span>
+  {% if user.is_authenticated %}<a class="btn primary" href="{% url 'accounts:welcome' %}">Open my workspace</a>
+  {% else %}<a class="btn" href="{% url 'accounts:login' %}">Sign in</a><a class="btn primary" href="{% url 'accounts:package' %}">Create account</a>{% endif %}
+</header>
+<section class="hero">
+  <h1>Your physiotherapy workspace, in one place.</h1>
+  <p>Keep your patients, SOAP notes, assessments, treatment plans and home exercise programmes together, private to you, and ready to print or send.</p>
+  <div class="actions"><a class="btn primary" href="{% url 'accounts:package' %}">Create a professional account</a><a class="btn" href="{% url 'accounts:login' %}">Sign in</a></div>
+</section>
+<section class="grid">
+  <div class="card"><h3>Patients</h3><p>Search, filter and open a patient to see their sessions, notes, plans and exercises. Private pictures and ICD-10 diagnosis lookup.</p></div>
+  <div class="card"><h3>SOAP notes</h3><p>A full physiotherapy S/O/A/P form with pain, red flags, range of motion, strength and special tests. Draft, finalise (locked) and add addenda.</p></div>
+  <div class="card"><h3>Assessments</h3><p>25 ready-made scales (Barthel, Berg, TUG, NDI, LEFS and more) with automatic totals, interpretation and progress over time.</p></div>
+  <div class="card"><h3>Treatment plans</h3><p>Baseline measures, goals, phased interventions and progress readings, printable for the patient.</p></div>
+  <div class="card"><h3>Exercise library</h3><p>Hundreds of exercises with pictures and videos. Send a home programme as a PDF in English and Nepali by WhatsApp or e-mail.</p></div>
+  <div class="card"><h3>Reports</h3><p>Weekly or monthly activity, new and follow-up clients by age and sex, top diagnoses and exercise adherence, with CSV download.</p></div>
+</section>
+<footer>Sajhya Professional &middot; Accounts are verified by our team before the workspace opens.</footer>
+</body>
+</html>

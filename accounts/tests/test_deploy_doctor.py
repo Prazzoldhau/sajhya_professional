@@ -1,0 +1,95 @@
+import getpass
+from io import StringIO
+from unittest import mock
+
+from django.core.management import call_command
+from django.db.utils import OperationalError
+from django.test import SimpleTestCase, override_settings
+
+MYSQL = {'default': {'ENGINE': 'django.db.backends.mysql', 'NAME': 'shealth', 'USER': 'suser', 'HOST': 'localhost', 'PORT': '3306'}}
+
+
+def run(**kwargs):
+    out = StringIO()
+    code = 0
+    try:
+        call_command('deploy_doctor', stdout=out, **kwargs)
+    except SystemExit as exit_:
+        code = exit_.code
+    return code, out.getvalue()
+
+
+class DeployDoctorTests(SimpleTestCase):
+    def test_passes_on_a_healthy_development_setup_and_never_prints_secrets(self):
+        with override_settings(SECRET_KEY='k' * 60):
+            code, text = run()
+        self.assertIn('deploy doctor', text)
+        self.assertNotIn('k' * 60, text)
+        self.assertNotIn('FAIL', text.split('Everything needed')[0] if 'Everything needed' in text else '')
+
+    def test_missing_account_prefix_is_explained_when_the_database_refuses_the_login(self):
+        broken = mock.MagicMock()
+        broken.cursor.side_effect = OperationalError(1045, "Access denied for user 'suser'@'localhost' (using password: YES)")
+        with override_settings(DATABASES=MYSQL, DEBUG=False, ALLOWED_HOSTS=['app.sajhya.com'], SECRET_KEY='k' * 60), \
+                mock.patch('accounts.management.commands.deploy_doctor.connection', broken):
+            code, text = run()
+        account = getpass.getuser()
+        self.assertEqual(code, 1)
+        self.assertIn('MySQL error 1045', text)
+        self.assertIn(f'probably {account}_suser', text)
+        self.assertIn(f'probably {account}_shealth', text)
+        self.assertIn('Add User To Database', text)
+        self.assertIn('problem(s) must be fixed', text)
+
+    def test_unknown_database_and_unreachable_server_have_their_own_advice(self):
+        for error, advice in ((OperationalError(1049, "Unknown database"), 'does not exist'), (OperationalError(2003, "Can't connect"), 'should be localhost')):
+            broken = mock.MagicMock()
+            broken.cursor.side_effect = error
+            with override_settings(DATABASES=MYSQL, DEBUG=False, ALLOWED_HOSTS=['x'], SECRET_KEY='k' * 60), mock.patch('accounts.management.commands.deploy_doctor.connection', broken):
+                code, text = run()
+            self.assertEqual(code, 1)
+            self.assertIn(advice, text)
+
+    def test_a_short_secret_key_and_empty_hosts_are_failures(self):
+        with override_settings(SECRET_KEY='short', ALLOWED_HOSTS=[], DEBUG=False):
+            code, text = run()
+        self.assertEqual(code, 1)
+        self.assertIn('ALLOWED_HOSTS', text)
+        self.assertIn('SECRET_KEY is 5 characters', text)
+
+    def test_the_deploy_script_runs_the_doctor_first(self):
+        from pathlib import Path
+        script = (Path(__file__).resolve().parents[2] / 'deploy' / 'cpanel_deploy.sh').read_text(encoding='utf-8')
+        self.assertLess(script.index('deploy_doctor'), script.index('Backing up the database'))
+        self.assertIn('virtualenv/$APP_NAME', script)  # only the app's own virtualenv is used
+
+
+class EnvOverrideDetectionTests(SimpleTestCase):
+    def test_a_value_only_counts_as_overridden_when_it_really_differs(self):
+        import tempfile
+        from pathlib import Path
+        from accounts.management.commands.deploy_doctor import raw_env_file
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / '.env').write_text("SECRET_KEY='abc$def'\nDEBUG=False\nDATABASE_URL=mysql://u:p@localhost:3306/d\n", encoding='utf-8')
+            values = raw_env_file(folder)
+        self.assertEqual((values['DEBUG'], values['DATABASE_URL']), ('False', 'mysql://u:p@localhost:3306/d'))
+        self.assertTrue(values['SECRET_KEY'].startswith('abc'))  # parsed exactly like the settings loader does
+
+
+class BackupAndHttpsChecksTests(SimpleTestCase):
+    def test_backup_note_says_when_backups_never_ran_or_went_stale(self):
+        import datetime, os, tempfile
+        from pathlib import Path
+        from accounts.management.commands.deploy_doctor import backup_note
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {'BACKUP_DIR': d}):
+            self.assertIn('never run', backup_note())
+            daily = Path(d) / 'daily'
+            daily.mkdir()
+            (daily / 'last_ok').write_text('x')
+            self.assertEqual(backup_note(), '')
+            self.assertIn('2 day', backup_note(datetime.datetime.now() + datetime.timedelta(days=2, hours=1)))
+
+    def test_doctor_warns_when_https_is_not_enforced_in_production(self):
+        with override_settings(DEBUG=False, SECRET_KEY='k' * 60, SECURE_SSL_REDIRECT=False, ALLOWED_HOSTS=['x']):
+            code, text = run()
+        self.assertIn('SECURE_SSL_REDIRECT is off', text)

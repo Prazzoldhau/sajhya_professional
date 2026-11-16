@@ -1,0 +1,321 @@
+import json
+
+from django.contrib import messages
+from django.contrib.auth.decorators import login_required
+from django.core.paginator import Paginator
+from django.db import transaction
+from django.db.models import Count, Max, Prefetch, Q
+from django.http import Http404, HttpResponse, JsonResponse
+from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
+from django.utils import timezone
+
+from accounts import audit
+from accounts.access import accessible_patients, own_patient, require_workspace, workspace_context
+from assessments import disciplines
+
+from .models import DifficultyLevel, ExerciseMain, ExerciseStepImage, Prescription, PrescriptionExercise, Region, SubRegion
+
+PAGE_SIZE = 24
+
+
+def _current_discipline(request, profile, remember=True):
+    """The department's library being used: the requested one (kept for the session) when this person may use it, else their own."""
+    requested = request.GET.get('discipline')
+    if remember and requested in disciplines.SPECIFIC:
+        request.session['library_discipline'] = requested
+    return disciplines.chosen(profile, requested or request.session.get('library_discipline'))
+
+
+def _library_filter(profile, current=None):
+    """Which exercises a person may use: their own department's plus the general ones (all their departments when they work across several)."""
+    return disciplines.visible_filter([current] if current else disciplines.allowed(profile))
+
+
+def _exercise_json(e, detail=False):
+    data = {
+        'id': e.pk, 'name': e.exercise_name, 'type': e.exercise_type, 'level': e.difficulty_level,
+        'level_label': e.get_difficulty_level_display(), 'sets': e.default_sets, 'reps': e.default_reps,
+        'hold': e.hold_time_sec, 'rest': e.default_rest_time_sec, 'dose': e.dose_label, 'cover': e.cover,
+    }
+    if detail:
+        data.update({
+            'region': e.sub_region_fk.region_fk.label, 'sub_region': e.sub_region_fk.sub_region_name,
+            'description': e.exercise_description, 'description_ne': e.exercise_description_nepali,
+            'images': e.images, 'youtube_url': e.youtube_url, 'video_url': e.hosted_video_url,
+            'step_labels': [s.label for s in e.step_images.all()],
+        })
+    return data
+
+
+@login_required
+def library(request):
+    profile = require_workspace(request)
+
+    sub_id, region_id = request.GET.get('sub', ''), request.GET.get('region', '')
+    q, ex_type, level = request.GET.get('q', '').strip(), request.GET.get('type', ''), request.GET.get('level', '')
+
+    current = _current_discipline(request, profile)
+    visible = _library_filter(profile, current)
+    exercises = ExerciseMain.objects.filter(discipline__in=visible).select_related('sub_region_fk__region_fk').prefetch_related(
+        Prefetch('step_images', queryset=ExerciseStepImage.objects.order_by('order')))
+    if sub_id.isdigit():
+        exercises = exercises.filter(sub_region_fk_id=sub_id)
+    elif region_id.isdigit():
+        exercises = exercises.filter(sub_region_fk__region_fk_id=region_id)
+    if q:
+        exercises = exercises.filter(Q(exercise_name__icontains=q) | Q(exercise_type__icontains=q) | Q(exercise_description__icontains=q))
+    if ex_type:
+        exercises = exercises.filter(exercise_type=ex_type)
+    if level.isdigit():
+        exercises = exercises.filter(difficulty_level=level)
+
+    page = Paginator(exercises.order_by('exercise_name'), PAGE_SIZE).get_page(request.GET.get('page'))
+    params = request.GET.copy()
+    params.pop('page', None)
+
+    regions = [r for r in Region.objects.prefetch_related(
+        Prefetch('subregions', queryset=SubRegion.objects.annotate(n=Count('exercises', filter=Q(exercises__discipline__in=visible))).filter(n__gt=0).order_by('sub_region_name')))
+        if r.subregions.all()]  # only the regions that have something in this department's library
+    available = set(ExerciseMain.objects.values_list('discipline', flat=True)) | {'general'}
+    switcher = [(d, disciplines.LABELS[d], d == current) for d in disciplines.allowed(profile) if d in available or d == current] if len(disciplines.allowed(profile)) > 1 else []
+
+    patient = prescription = None
+    if request.GET.get('patient', '').isdigit():
+        _, patient = own_patient(request, request.GET['patient'])
+        if request.GET.get('prescription', '').isdigit():
+            prescription = Prescription.objects.filter(pk=request.GET['prescription'], patient=patient,
+                                                       status=Prescription.ACTIVE).first()
+
+    context = workspace_context(request.user, profile)
+    context.update({
+        'active': 'exercises', 'page_obj': page, 'regions': regions, 'total': ExerciseMain.objects.filter(discipline__in=visible).count(),
+        'current': current, 'current_label': disciplines.LABELS[current], 'switcher': switcher,
+        'sub': sub_id, 'region': region_id, 'q': q, 'type': ex_type, 'level': level, 'querystring': params.urlencode(),
+        'types': ExerciseMain.objects.filter(discipline__in=visible).order_by('exercise_type').values_list('exercise_type', flat=True).distinct(),
+        'levels': DifficultyLevel.choices,
+        'patient': patient, 'prescription': prescription,
+        'patient_json': {'id': patient.pk, 'name': patient.name, 'code': patient.patient_code,
+                         'condition': patient.diagnosis} if patient else None,
+        'prescription_json': {'id': prescription.pk, 'label': prescription.condition_label} if prescription else None,
+    })
+    return render(request, 'exercises/library.html', context)
+
+
+@login_required
+def exercise_detail(request, pk):
+    profile = require_workspace(request)
+    e = get_object_or_404(ExerciseMain.objects.filter(discipline__in=_library_filter(profile)).select_related('sub_region_fk__region_fk'), pk=pk)
+    return JsonResponse(_exercise_json(e, detail=True))
+
+
+@login_required
+def exercise_search(request):
+    """Type-ahead used by the treatment plan builder's home-exercise rows."""
+    profile = require_workspace(request)
+    q = request.GET.get('q', '').strip()
+    if len(q) < 2:
+        return JsonResponse({'results': []})
+    found = ExerciseMain.objects.filter(discipline__in=_library_filter(profile, _current_discipline(request, profile, remember=False)), exercise_name__icontains=q).prefetch_related('step_images').order_by('exercise_name')[:12]
+    return JsonResponse({'results': [{'id': e.pk, 'name': e.exercise_name, 'dose': e.dose_label, 'cover': e.cover} for e in found]})
+
+
+def _add_exercises(prescription, rows, start_order, visible):
+    created = 0
+    for offset, row in enumerate(rows):
+        exercise = ExerciseMain.objects.filter(pk=row.get('id'), discipline__in=visible).first()
+        if exercise is None:
+            continue
+
+        def num(key, default, low=0, high=999):
+            try:
+                return max(low, min(int(row.get(key, default)), high))
+            except (TypeError, ValueError):
+                return default
+        PrescriptionExercise.objects.create(
+            prescription=prescription, exercise=exercise, exercise_name=exercise.exercise_name,
+            difficulty_level=exercise.difficulty_level, order=start_order + offset,
+            sets=num('sets', exercise.default_sets, 1, 50), reps=num('reps', exercise.default_reps, 1, 500),
+            hold_time_sec=num('hold', exercise.hold_time_sec, 0, 600), rest_time_sec=num('rest', exercise.default_rest_time_sec, 0, 600),
+            schedule_morning=bool(row.get('morning', True)), schedule_day=bool(row.get('day', False)),
+            schedule_evening=bool(row.get('evening', False)))
+        created += 1
+    return created
+
+
+@login_required
+@transaction.atomic
+def prescribe(request):
+    if request.method != 'POST':
+        raise Http404
+    profile = require_workspace(request)
+    try:
+        data = json.loads(request.body)
+    except ValueError:
+        return JsonResponse({'ok': False, 'error': 'Could not read the request.'}, status=400)
+    patient = accessible_patients(profile).filter(pk=data.get('patient_id') or 0).first()
+    if patient is None:
+        return JsonResponse({'ok': False, 'error': 'Choose a patient first.'}, status=400)
+    rows = data.get('exercises') or []
+    if not rows:
+        return JsonResponse({'ok': False, 'error': 'Select at least one exercise.'}, status=400)
+
+    visible = _library_filter(profile)  # only exercises from the departments this person works in
+    existing = set(ExerciseMain.objects.filter(pk__in=[r.get('id') for r in rows if str(r.get('id', '')).isdigit()], discipline__in=visible).values_list('pk', flat=True))
+    rows = [r for r in rows if str(r.get('id', '')).isdigit() and int(r['id']) in existing]
+    if not rows:  # checked before anything is created, so a bad request never supersedes the patient's current prescription
+        return JsonResponse({'ok': False, 'error': 'None of the selected exercises exist any more.'}, status=400)
+
+    prescription = None
+    if data.get('prescription_id'):
+        prescription = Prescription.objects.filter(pk=data['prescription_id'], patient=patient, status=Prescription.ACTIVE).first()
+    if prescription:
+        start = (prescription.exercises.aggregate(m=Max('order'))['m'] or -1) + 1
+    else:
+        prescription = Prescription.objects.create(patient=patient, professional=profile,
+                                                   condition_label=(data.get('condition_label') or '').strip()[:100])
+        start = 0
+    count = _add_exercises(prescription, rows, start, visible)
+    messages.success(request, f'Prescribed {count} exercise{"s" if count != 1 else ""} to {patient.name}.')
+    return JsonResponse({'ok': True, 'redirect': f"{reverse('accounts:patient-detail', args=[patient.pk])}?tab=exercises"})
+
+
+@login_required
+@transaction.atomic
+def prescription_action(request, pk):
+    profile = require_workspace(request)
+    prescription = get_object_or_404(Prescription, pk=pk, patient__in=accessible_patients(profile))
+    back = redirect(f"{reverse('accounts:patient-detail', args=[prescription.patient_id])}?tab=exercises")
+    if request.method != 'POST':
+        return back
+    action = request.POST.get('action')
+
+    if action in ('complete', 'cancel', 'reopen'):
+        prescription.status = {'complete': Prescription.COMPLETED, 'cancel': Prescription.CANCELLED, 'reopen': Prescription.ACTIVE}[action]
+        prescription.save()
+        messages.success(request, f'Prescription marked {prescription.get_status_display().lower()}.')
+    elif action == 'toggle':
+        item = get_object_or_404(PrescriptionExercise, pk=request.POST.get('item'), prescription=prescription)
+        item.is_completed = not item.is_completed
+        item.completed_at = timezone.now() if item.is_completed else None
+        item.save(update_fields=['is_completed', 'completed_at'])
+    elif action == 'remove':
+        get_object_or_404(PrescriptionExercise, pk=request.POST.get('item'), prescription=prescription).delete()
+    elif action == 'reassign':
+        copy = Prescription.objects.create(patient=prescription.patient, professional=profile,
+                                           condition_label=prescription.condition_label)
+        for item in prescription.exercises.all():
+            PrescriptionExercise.objects.create(
+                prescription=copy, exercise=item.exercise, exercise_name=item.exercise_name,
+                difficulty_level=item.difficulty_level, sets=item.sets, reps=item.reps, hold_time_sec=item.hold_time_sec,
+                rest_time_sec=item.rest_time_sec, order=item.order, schedule_morning=item.schedule_morning,
+                schedule_day=item.schedule_day, schedule_evening=item.schedule_evening)
+        messages.success(request, 'Prescription re-assigned as a fresh copy.')
+    return back
+
+
+# ---------------------------------------------------------------------------
+# Sending a prescribed programme to the patient: a PDF with pictures and the instructions in English and Nepali
+# ---------------------------------------------------------------------------
+
+def _rx_for(request, pk):
+    profile = require_workspace(request)
+    prescription = get_object_or_404(Prescription.objects.select_related('patient', 'professional'), pk=pk, patient__in=accessible_patients(profile))
+    return profile, prescription
+
+
+def _pdf_response(prescription, online_url='', download=False):
+    from . import handout
+    response = HttpResponse(handout.build_pdf(prescription, prescription.professional, online_url), content_type='application/pdf')
+    response['Content-Disposition'] = f'{"attachment" if download else "inline"}; filename="{handout.file_name(prescription)}"'
+    response['Cache-Control'] = 'private, no-store'
+    return response
+
+
+@login_required
+def send(request, pk):
+    """The programme laid out for sending: download the PDF, open WhatsApp / Viber / SMS with the link, or e-mail the PDF."""
+    from accounts.access import can_see_contact
+    from accounts.messaging import channel_links
+    from accounts.messaging import whatsapp_chat
+
+    from . import handout
+    profile, prescription = _rx_for(request, pk)
+    patient = prescription.patient
+    public_url = request.build_absolute_uri(reverse('exercises:public', args=[handout.token(prescription)]))
+    phone = patient.phone if can_see_contact(profile, patient) else ''
+    email = patient.email if can_see_contact(profile, patient) else ''
+    message = handout.share_message(prescription, prescription.professional, public_url)
+    items = list(prescription.exercises.select_related('exercise').prefetch_related('exercise__step_images'))
+    context = workspace_context(request.user, profile)
+    context.update({
+        'active': 'patients', 'patient': patient, 'prescription': prescription, 'items': items, 'public_url': public_url, 'message': message, 'phone': phone, 'email': email,
+        'patient_has_email': bool(patient.email), 'can_save_email': can_see_contact(profile, patient), 'link_days': handout.LINK_DAYS, 'file_name': handout.file_name(prescription),
+        'links': channel_links(phone, message, patient.messaging_app, profile.whatsapp_web), 'whatsapp_chat': whatsapp_chat(phone, profile.whatsapp_web),
+        'with_pictures': sum(1 for i in items if i.exercise_id and i.exercise.images), 'with_nepali': sum(1 for i in items if i.exercise_id and i.exercise.exercise_description_nepali),
+        'back_url': f"{reverse('accounts:patient-detail', args=[patient.pk])}?tab=exercises",
+    })
+    audit.log_access(request, 'view', patient=patient, detail='opened the send page of an exercise programme')
+    return render(request, 'exercises/send.html', context)
+
+
+@login_required
+def handout_pdf(request, pk):
+    profile, prescription = _rx_for(request, pk)
+    audit.log_access(request, 'download', patient=prescription.patient, detail='downloaded the PDF of an exercise programme')
+    return _pdf_response(prescription, download=request.GET.get('download') == '1')
+
+
+def public(request, token):
+    """The link a patient receives: the PDF, no sign-in. It is signed, cannot be guessed, and expires."""
+    from . import handout
+    prescription = handout.prescription_from_token(token)
+    if prescription is None:
+        raise Http404
+    return _pdf_response(prescription, request.build_absolute_uri(request.path))
+
+
+@login_required
+def send_email(request, pk):
+    from django.core.exceptions import ValidationError
+    from django.core.mail import EmailMultiAlternatives
+    from django.core.validators import validate_email
+
+    from accounts.access import can_see_contact
+    from accounts.messaging import EMAIL_NOT_SET_UP, email_ready
+
+    from . import handout
+    if request.method != 'POST':
+        raise Http404
+    profile, prescription = _rx_for(request, pk)
+    patient = prescription.patient
+    back = redirect('exercises:send', pk=prescription.pk)
+    if not email_ready():
+        messages.error(request, EMAIL_NOT_SET_UP)
+        return back
+    address = request.POST.get('email', '').strip()
+    try:
+        validate_email(address)
+    except ValidationError:
+        messages.error(request, 'Enter a valid e-mail address.')
+        return back
+    url = request.build_absolute_uri(reverse('exercises:public', args=[handout.token(prescription)]))
+    practice = prescription.professional.practice_name or prescription.professional.full_name
+    message = handout.share_message(prescription, prescription.professional, url)
+    mail = EmailMultiAlternatives(subject=f'Your home exercise programme from {practice}', body=message + '\n\nThe programme is attached as a PDF.\n\n' + practice, to=[address],
+                                  reply_to=[e for e in [prescription.professional.account.user.email] if e])
+    mail.attach_alternative(handout.email_html(prescription, prescription.professional, url, message), 'text/html')
+    mail.attach(handout.file_name(prescription), handout.build_pdf(prescription, prescription.professional, url), 'application/pdf')
+    try:
+        mail.send()
+    except Exception:  # the mail server is outside our control: say so plainly instead of a server error
+        messages.error(request, 'The e-mail could not be sent right now. Use WhatsApp or the PDF download instead, or try again later.')
+        return back
+    saved = ''
+    if request.POST.get('save_email') and not patient.email and can_see_contact(profile, patient):
+        patient.email = address
+        patient.save(update_fields=['email'])
+        saved = " and saved on the patient's record"
+    audit.log_access(request, 'share', patient=patient, detail='e-mailed an exercise programme to the patient', dedupe=False)
+    messages.success(request, f'The programme was e-mailed to {address}{saved}.')
+    return back
